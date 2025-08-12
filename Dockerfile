@@ -1,12 +1,14 @@
-# Use Python 3.11 slim image
 FROM python:3.11-slim
 
-# Install system dependencies for MS SQL Server and Ansible
+# Install system dependencies for MS SQL Server, Ansible, and Kafka client
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
     unixodbc-dev \
     ansible \
+    libsasl2-dev \
+    libsasl2-modules-gssapi-heimdal \
+    libssl-dev \
     && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
     && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \
@@ -39,6 +41,9 @@ COPY database/ ./database/
 COPY ml_sentiment_api/app_with_db.py ./app.py
 COPY ml_sentiment_api/sentiment_model.pkl .
 COPY ml_sentiment_api/tfidf_vectorizer.pkl .
+COPY kafka_producer.py .
+COPY kafka_consumer.py .
+COPY kafka_consumer_service.py .
 
 # Copy test files
 COPY test_model.py .

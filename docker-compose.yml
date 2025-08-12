@@ -1,6 +1,38 @@
 version: '3.8'
 
 services:
+  # Zookeeper for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - ml-network
+
+  # Kafka Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks:
+      - ml-network
+
   # MS SQL Server Database
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -29,15 +61,35 @@ services:
     container_name: ml-sentiment-api
     environment:
       - FLASK_ENV=production
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=sentiment_predictions
     ports:
       - "5000:5000"
     depends_on:
       mssql:
         condition: service_healthy
+      kafka:
+        condition: service_started
     networks:
       - ml-network
     volumes:
       - ./logs:/app/logs
+    restart: unless-stopped
+
+  # Kafka Consumer Service
+  kafka-consumer:
+    build: .
+    container_name: kafka-consumer-service
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=sentiment_predictions
+      - KAFKA_CONSUMER_GROUP_ID=sentiment_group
+    depends_on:
+      - kafka
+      - mssql
+    networks:
+      - ml-network
+    command: python kafka_consumer_service.py
     restart: unless-stopped
 
 volumes:
