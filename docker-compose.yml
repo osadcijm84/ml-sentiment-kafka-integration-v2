@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # MS SQL Server Database
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql-server
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=StrongPassword123!
+      - MSSQL_PID=Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ml-network
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P StrongPassword123! -Q 'SELECT 1'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ML Sentiment API
+  ml-api:
+    build: .
+    container_name: ml-sentiment-api
+    environment:
+      - FLASK_ENV=production
+    ports:
+      - "5000:5000"
+    depends_on:
+      mssql:
+        condition: service_healthy
+    networks:
+      - ml-network
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  mssql_data:
+    driver: local
+
+networks:
+  ml-network:
+    driver: bridge
+
+
