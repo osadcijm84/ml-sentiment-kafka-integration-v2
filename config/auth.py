@@ -29,6 +29,12 @@ class AuthConfig:
             secrets_data.get("api_key", os.getenv("API_KEY_1", self._generate_api_key())): "ml-client-1",
             os.getenv("API_KEY_2", self._generate_api_key()): "ml-client-2" # Keep this for now, can be moved to vault later
         }
+
+        # Kafka secrets
+        self.kafka_bootstrap_servers = secrets_data.get("kafka_bootstrap_servers", "localhost:9092")
+        self.kafka_topic = secrets_data.get("kafka_topic", "sentiment_predictions")
+        self.kafka_consumer_group_id = secrets_data.get("kafka_consumer_group_id", "sentiment_group")
+
     
     def _generate_secret_key(self) -> str:
         """Generate a secure secret key"""
@@ -59,7 +65,7 @@ class AuthConfig:
             return None
     
     def verify_api_key(self, api_key: str) -> Optional[str]:
-        """Verify API key and return client name"""
+        """Verify API key and return client name""" 
         return self.api_keys.get(api_key)
     
     def hash_password(self, password: str) -> str:
@@ -128,7 +134,7 @@ def require_token(f):
     return decorated_function
 
 def optional_auth(f):
-    """Decorator for optional authentication (logs requests but doesn't block)"""
+    """Decorator for optional authentication (logs requests but doesn\"t block)"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         # Try API key first
