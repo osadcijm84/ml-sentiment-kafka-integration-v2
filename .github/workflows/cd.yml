@@ -1,0 +1,238 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+  schedule:
+    # Run functional tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  DOCKER_IMAGE: osadcijm84/ml-sentiment-kafka-integration-v2
+
+jobs:
+  deploy-and-test:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set deployment environment
+      id: env
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+        else
+          echo "environment=staging" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up Docker Compose
+      run: |
+        sudo curl -L "https://github.com/docker/compose/releases/download/v2.21.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+        docker-compose --version
+
+    - name: Pull latest Docker image
+      run: |
+        docker pull ${{ env.DOCKER_IMAGE }}:latest
+
+    - name: Deploy with Docker Compose
+      run: |
+        docker-compose down --remove-orphans
+        docker-compose up -d
+        
+    - name: Wait for services to be ready
+      run: |
+        echo "Waiting for services to start..."
+        sleep 30
+        
+        # Wait for Zookeeper
+        for i in {1..30}; do
+          if docker-compose exec -T zookeeper /bin/sh -c "[ \$(echo ruok | nc localhost 2181) = \"imok\" ]" > /dev/null 2>&1; then
+            echo "Zookeeper is ready"
+            break
+          fi
+          echo "Waiting for Zookeeper... ($i/30)"
+          sleep 2
+        done
+
+        # Wait for Kafka
+        for i in {1..30}; do
+          if docker-compose exec -T kafka /bin/sh -e -c "kafka-topics --bootstrap-server localhost:9092 --list" > /dev/null 2>&1; then
+            echo "Kafka is ready"
+            break
+          fi
+          echo "Waiting for Kafka... ($i/30)"
+          sleep 2
+        done
+
+        # Wait for database
+        for i in {1..30}; do
+          if docker-compose exec -T mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P StrongPassword123! -Q 'SELECT 1' > /dev/null 2>&1; then
+            echo "Database is ready"
+            break
+          fi
+          echo "Waiting for database... ($i/30)"
+          sleep 2
+        done
+        
+        # Wait for API
+        for i in {1..30}; do
+          if curl -f http://localhost:5000/api/health > /dev/null 2>&1; then
+            echo "API is ready"
+            break
+          fi
+          echo "Waiting for API... ($i/30)"
+          sleep 2
+        done
+
+    - name: Run functional tests
+      run: |
+        echo "Running functional tests..."
+        
+        # Test 1: Health check
+        echo "Test 1: Health check"
+        response=$(curl -s http://localhost:5000/api/health)
+        echo "Health response: $response"
+        if [[ $(echo $response | jq -r '.status') != "healthy" ]]; then
+          echo "❌ Health check failed"
+          exit 1
+        fi
+        echo "✅ Health check passed"
+        
+        # Test 2: Basic prediction without auth
+        echo "Test 2: Basic prediction"
+        response=$(curl -s -X POST http://localhost:5000/api/predict \
+          -H "Content-Type: application/json" \
+          -d '{"text": "This product is amazing!"}')
+        echo "Prediction response: $response"
+        if [[ $(echo $response | jq -r '.sentiment') != "positive" ]]; then
+          echo "❌ Basic prediction failed"
+          exit 1
+        fi
+        echo "✅ Basic prediction passed"
+        
+        # Test 3: API key authentication
+        echo "Test 3: API key authentication"
+        # Fetch API key from the running container (assuming it's exposed for testing purposes)
+        API_KEY=$(docker-compose exec ml-api python -c "from config.auth import auth_config; print(list(auth_config.api_keys.keys())[0])")
+        if [[ -n "$API_KEY" ]]; then
+          response=$(curl -s http://localhost:5000/api/predictions \
+            -H "X-API-Key: $API_KEY")
+          echo "Predictions response: $response"
+          if [[ $(echo $response | jq -r '.predictions') == "null" ]]; then
+            echo "❌ API key authentication failed"
+            exit 1
+          fi
+          echo "✅ API key authentication passed"
+        else
+          echo "⚠️ API key not configured, skipping auth test"
+        fi
+        
+        # Test 4: Database connectivity
+        echo "Test 4: Database connectivity"
+        health_response=$(curl -s http://localhost:5000/api/health)
+        db_connected=$(echo $health_response | jq -r '.database_connected')
+        if [[ "$db_connected" != "true" ]]; then
+          echo "❌ Database connectivity failed"
+          exit 1
+        fi
+        echo "✅ Database connectivity passed"
+
+        # Test 5: Kafka Producer functionality
+        echo "Test 5: Kafka Producer functionality"
+        health_response=$(curl -s http://localhost:5000/api/health)
+        kafka_producer_initialized=$(echo $health_response | jq -r '.kafka_producer_initialized')
+        if [[ "$kafka_producer_initialized" != "true" ]]; then
+          echo "❌ Kafka Producer not initialized"
+          exit 1
+        fi
+        echo "✅ Kafka Producer initialized"
+        
+        echo "🎉 All functional tests passed!"
+
+    - name: Run performance tests
+      run: |
+        echo "Running performance tests..."
+        
+        # Simple load test
+        echo "Running load test with 10 concurrent requests..."
+        for i in {1..10}; do
+          curl -s -X POST http://localhost:5000/api/predict \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"Test message $i\"}" &
+        done
+        wait
+        
+        echo "✅ Performance test completed"
+
+    - name: Collect logs
+      if: always()
+      run: |
+        echo "Collecting container logs..."
+        docker-compose logs > deployment-logs.txt
+        
+        echo "API container logs:"
+        docker-compose logs ml-api
+        
+        echo "Database container logs:"
+        docker-compose logs mssql
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-logs-${{ steps.env.outputs.environment }}
+        path: deployment-logs.txt
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker-compose down --remove-orphans
+        docker system prune -f
+
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [[ "${{ job.status }}" == "success" ]]; then
+          echo "✅ Deployment to ${{ steps.env.outputs.environment }} successful"
+        else
+          echo "❌ Deployment to ${{ steps.env.outputs.environment }} failed"
+        fi
+
+  security-scan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+

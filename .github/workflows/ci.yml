@@ -1,0 +1,178 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOCKER_IMAGE: osadcijm84/ml-sentiment-kafka-integration-v2
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.6.0
+        ports:
+          - 2181:2181
+        options: >-
+          --health-cmd="/bin/sh -c \"[ \$(echo ruok | nc localhost 2181) = \"imok\" ]\""
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      kafka:
+        image: confluentinc/cp-kafka:7.6.0
+        ports:
+          - 9092:9092
+        environment:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        depends_on:
+          zookeeper:
+            condition: service_healthy
+        options: >-
+          --health-cmd="/bin/sh -e -c \"kafka-topics --bootstrap-server localhost:9092 --list\""
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          SA_PASSWORD: StrongPassword123!
+          MSSQL_PID: Express
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P StrongPassword123! -Q 'SELECT 1'"
+          --health-interval=30s
+          --health-timeout=10s
+          --health-retries=5
+          --health-start-period=30s
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl gnupg unixodbc-dev ansible libsasl2-dev libsasl2-modules-gssapi-heimdal libssl-dev
+        curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+        curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+        sudo apt-get update
+        sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyyaml
+
+    - name: Decrypt Ansible Vault secrets
+      run: |
+        echo "${{ secrets.VAULT_PASSWORD }}" > vault_password.txt
+        echo "${{ secrets.ENCRYPTED_SECRETS }}" > secrets.yml
+        ansible-vault decrypt secrets.yml --vault-password-file vault_password.txt
+      env:
+        VAULT_PASSWORD: ${{ secrets.VAULT_PASSWORD }}
+        ENCRYPTED_SECRETS: ${{ secrets.ENCRYPTED_SECRETS }}
+
+    - name: Wait for SQL Server
+      run: |
+        for i in {1..30}; do
+          if sqlcmd -S localhost,1433 -U sa -P StrongPassword123! -Q 'SELECT 1' > /dev/null 2>&1; then
+            echo "SQL Server is ready"
+            break
+          fi
+          echo "Waiting for SQL Server... ($i/30)"
+          sleep 2
+        done
+
+    - name: Initialize database
+      run: |
+        sqlcmd -S localhost,1433 -U sa -P StrongPassword123! -i sql/init.sql
+
+    - name: Run unit tests
+      run: |
+        python -m pytest test_model.py -v --cov=. --cov-report=xml
+
+    - name: Run API tests
+      run: |
+        python -m pytest test_api.py -v
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Update deployment status
+      run: |
+        echo "Docker image pushed successfully: ${{ env.DOCKER_IMAGE }}:latest"
+        echo "Available tags: ${{ steps.meta.outputs.tags }}"
+
+
